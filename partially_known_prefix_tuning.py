@@ -19,8 +19,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, 
 from privacy_metrics.Metrics import entities_in_paragraph, leaked_percentage
 
 DEFAULT_MODEL_NAME = "princeton-nlp/Sheared-LLaMA-1.3B"
-DEFAULT_INPUT_CSV = "fine_tuning_data_first_six_paragraphs_direct.csv"
-DEFAULT_OUTPUT_JSONL = "synthetic_ft_data_icl_partial.jsonl"
+DEFAULT_CHECKPOINT_DIR = Path("sheared-llama-privacy-prefix-partial")
+DEFAULT_CHECKPOINT_NAME = "final_checkpoint"
+DEFAULT_INPUT_CSV = Path("fine_tuning_data_first_six_paragraphs_direct.csv")
+DEFAULT_OUTPUT_JSONL = Path("synthetic_ft_data_partial_prefix.jsonl")
 DEFAULT_CONTEXT_SIZE = 3
 DEFAULT_MAX_ROWS: Optional[int] = 100
 DEFAULT_MAX_NEW_TOKENS = 400
@@ -40,10 +42,12 @@ STOP_STRINGS = [
 
 
 @dataclass
-class PartialICLConfig:
+class PartialPrefixConfig:
     model_name: str = DEFAULT_MODEL_NAME
-    input_csv: Path = Path(DEFAULT_INPUT_CSV)
-    output_jsonl: Path = Path(DEFAULT_OUTPUT_JSONL)
+    checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR
+    checkpoint_name: str = DEFAULT_CHECKPOINT_NAME
+    input_csv: Path = DEFAULT_INPUT_CSV
+    output_jsonl: Path = DEFAULT_OUTPUT_JSONL
     context_size: int = DEFAULT_CONTEXT_SIZE
     max_rows: Optional[int] = DEFAULT_MAX_ROWS
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS
@@ -51,19 +55,30 @@ class PartialICLConfig:
     top_p: float = DEFAULT_TOP_P
 
 
-def parse_args() -> PartialICLConfig:
-    parser = argparse.ArgumentParser(description="Partially known ICL generation with Presidio-derived control codes.")
+def parse_args() -> PartialPrefixConfig:
+    parser = argparse.ArgumentParser(description="Partially known prefix tuning evaluation with Presidio control codes.")
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME, help="Base model identifier to load.")
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=DEFAULT_CHECKPOINT_DIR,
+        help="Directory containing the PEFT checkpoint.",
+    )
+    parser.add_argument(
+        "--checkpoint-name",
+        default=DEFAULT_CHECKPOINT_NAME,
+        help="Checkpoint subdirectory name inside --checkpoint-dir.",
+    )
     parser.add_argument(
         "--input-csv",
         type=Path,
-        default=Path(DEFAULT_INPUT_CSV),
-        help="CSV file containing control codes and reference outputs.",
+        default=DEFAULT_INPUT_CSV,
+        help="CSV file containing official control codes and reference outputs.",
     )
     parser.add_argument(
         "--output-jsonl",
         type=Path,
-        default=Path(DEFAULT_OUTPUT_JSONL),
+        default=DEFAULT_OUTPUT_JSONL,
         help="Destination for generated prompt/output pairs.",
     )
     parser.add_argument(
@@ -82,13 +97,13 @@ def parse_args() -> PartialICLConfig:
         "--max-new-tokens",
         type=int,
         default=DEFAULT_MAX_NEW_TOKENS,
-        help="Maximum tokens to generate per context window.",
+        help="Maximum number of tokens to generate per context window.",
     )
     parser.add_argument(
         "--temperature",
         type=float,
         default=DEFAULT_TEMPERATURE,
-        help="Sampling temperature.",
+        help="Sampling temperature for generation.",
     )
     parser.add_argument(
         "--top-p",
@@ -102,8 +117,10 @@ def parse_args() -> PartialICLConfig:
     if max_rows is not None and max_rows <= 0:
         max_rows = None
 
-    return PartialICLConfig(
+    return PartialPrefixConfig(
         model_name=args.model_name,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_name=args.checkpoint_name,
         input_csv=args.input_csv,
         output_jsonl=args.output_jsonl,
         context_size=max(1, args.context_size),
@@ -254,10 +271,27 @@ def build_generators() -> Dict[str, callable]:
     }
 
 
-def run_partially_known(config: PartialICLConfig) -> None:
-    analyzer = AnalyzerEngine()
+def load_prefix_model(config: PartialPrefixConfig):
+    base_model = AutoModelForCausalLM.from_pretrained(config.model_name, use_cache=False)
+    from peft import PeftModel
+
+    model_path = config.checkpoint_dir / config.checkpoint_name
+    if not model_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found at {model_path}")
+
+    model = PeftModel.from_pretrained(base_model, model_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model.eval()
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    model = AutoModelForCausalLM.from_pretrained(config.model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return model, tokenizer, device
+
+
+def run_partially_known_prefix(config: PartialPrefixConfig) -> None:
+    analyzer = AnalyzerEngine()
+    model, tokenizer, device = load_prefix_model(config)
     stopper = StoppingCriteriaList([StopOnCode(tokenizer)])
     rouge = evaluate.load("rouge")
     generators = build_generators()
@@ -302,11 +336,6 @@ def run_partially_known(config: PartialICLConfig) -> None:
         base_prompt = prompt
         matches = pattern.findall(base_prompt)
 
-        extracted_values = []
-        for _, raw_value in matches:
-            parts = [item.strip() for item in raw_value.split(",") if item.strip()]
-            extracted_values.extend(parts)
-
         official_matches = pattern.findall(latest_official_code)
         official_values = []
         for _, raw_value in official_matches:
@@ -322,7 +351,7 @@ def run_partially_known(config: PartialICLConfig) -> None:
         if random_lines:
             generation_prompt = f"{base_prompt}\n" + "\n".join(random_lines)
 
-        inputs = tokenizer(generation_prompt, return_tensors="pt").to(model.device)
+        inputs = tokenizer(generation_prompt, return_tensors="pt").to(device)
         gen_ids = model.generate(
             **inputs,
             max_new_tokens=config.max_new_tokens,
@@ -330,6 +359,8 @@ def run_partially_known(config: PartialICLConfig) -> None:
             temperature=config.temperature,
             top_p=config.top_p,
             do_sample=True,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
 
         full_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
@@ -400,7 +431,7 @@ def run_partially_known(config: PartialICLConfig) -> None:
 
 def main() -> None:
     config = parse_args()
-    run_partially_known(config)
+    run_partially_known_prefix(config)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+accelerate>=0.21.0
+evaluate>=0.4.0
+numpy>=1.23.0
+pandas>=1.5.0
+peft>=0.10.0
+presidio-analyzer>=2.2.360
+sentencepiece>=0.1.99
+torch>=2.1.0
+transformers>=4.38.0
+tqdm>=4.64.0

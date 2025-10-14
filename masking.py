@@ -1,44 +1,52 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
-import csv, torch, re, os
+import argparse
+import csv
+import os
+import re
+
+import torch
+import tqdm
 from torch.nn import functional as F
 from peft import get_peft_model, PrefixTuningConfig, TaskType
-from torch.utils.data import Dataset, DataLoader
-import tqdm
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Specify the model name and files
-model_name = "princeton-nlp/Sheared-LLaMA-1.3B"
-train_csv_file = "fine_tuning_data_first_six_paragraphs.csv"
-eval_csv_file = "fine_tuning_data_first_six_paragraphs.csv"  # Using same file for testing
-output_dir = "sheared-llama-privacy-prefix"
+# Default configuration values (override via CLI)
+DEFAULT_MODEL_NAME = "princeton-nlp/Sheared-LLaMA-1.3B"
+DEFAULT_TRAIN_CSV = "fine_tuning_data_first_six_paragraphs.csv"
+DEFAULT_EVAL_CSV = "fine_tuning_data_first_six_paragraphs.csv"
+DEFAULT_OUTPUT_DIR = "sheared-llama-privacy-prefix"
 
 # Define privacy tags that should be detected
 TAG_RE = re.compile(r"^(CODE|PERSON|DATETIME|LOC|ORG|DEM|QUANTITY|MISE):\s*(.*)$", re.MULTILINE)
 
 
-# Load tokenizer and model
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-base_model = AutoModelForCausalLM.from_pretrained(model_name)
+def build_models(model_name: str):
+    """Load tokenizer/base model and attach prefix tuning adapter."""
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    base_model = AutoModelForCausalLM.from_pretrained(model_name)
 
-# Add padding token if not present
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.pad_token_id = tokenizer.eos_token_id
-    print(f"Using {tokenizer.pad_token} as padding token")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        print(f"Using {tokenizer.pad_token} as padding token")
 
-# Configure prefix tuning
-peft_config = PrefixTuningConfig(
-    task_type=TaskType.CAUSAL_LM,
-    num_virtual_tokens=20,
-    prefix_projection=True,
-    inference_mode=False,
-    token_dim=base_model.config.hidden_size,
-    num_attention_heads=base_model.config.num_attention_heads,
-    num_layers=base_model.config.num_hidden_layers,
-)
+    peft_config = PrefixTuningConfig(
+        task_type=TaskType.CAUSAL_LM,
+        num_virtual_tokens=20,
+        prefix_projection=True,
+        inference_mode=False,
+        token_dim=base_model.config.hidden_size,
+        num_attention_heads=base_model.config.num_attention_heads,
+        num_layers=base_model.config.num_hidden_layers,
+    )
 
-# Apply prefix tuning configuration to the model
-model = get_peft_model(base_model, peft_config)
-print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+    model = get_peft_model(base_model, peft_config)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable parameters: {trainable}")
+
+    return tokenizer, base_model, model
+
+
 
 class WeightedPrivacyDataset(Dataset):
     def __init__(self, file_path, tokenizer, max_length=2048):
@@ -530,27 +538,56 @@ class PrivacyPrefixTrainer:
         
         return self.model
 
-# Create datasets
-train_dataset = WeightedPrivacyDataset(train_csv_file, tokenizer)
-eval_dataset = WeightedPrivacyDataset(eval_csv_file, tokenizer)
+def run_masking(
+    model_name: str = DEFAULT_MODEL_NAME,
+    train_csv_file: str = DEFAULT_TRAIN_CSV,
+    eval_csv_file: str = DEFAULT_EVAL_CSV,
+    output_dir: str = DEFAULT_OUTPUT_DIR,
+):
+    """Train the masking model with the provided configuration."""
+    tokenizer, base_model, model = build_models(model_name)
+
+    train_dataset = WeightedPrivacyDataset(train_csv_file, tokenizer)
+    eval_dataset = WeightedPrivacyDataset(eval_csv_file, tokenizer)
+
+    trainer = PrivacyPrefixTrainer(
+        model=model,
+        base_model=base_model,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        output_dir=output_dir,
+        batch_size=2,
+        gradient_accumulation_steps=4,
+        learning_rate=5e-5,
+        num_epochs=3,
+        lm_loss_ratio=1.0,
+        contrastive_loss_ratio=4.0,
+        kl_loss_ratio=1.6,
+    )
+
+    trainer.train()
+    return trainer
 
 
-# Create trainer
-trainer = PrivacyPrefixTrainer(
-    model=model,
-    base_model=base_model,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
-    tokenizer=tokenizer,
-    output_dir=output_dir,
-    batch_size=2,
-    gradient_accumulation_steps=4,
-    learning_rate=5e-5,
-    num_epochs=3,
-    lm_loss_ratio=1.0,
-    contrastive_loss_ratio=4.0,
-    kl_loss_ratio=1.6
-)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Train the masking-based privacy model.")
+    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME, help="Base model to load from Hugging Face")
+    parser.add_argument("--train-csv", default=DEFAULT_TRAIN_CSV, help="Training CSV file path")
+    parser.add_argument("--eval-csv", default=DEFAULT_EVAL_CSV, help="Evaluation CSV file path")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory to write checkpoints")
+    return parser.parse_args(argv)
 
-# Train the model
-model = trainer.train()
+
+def main(argv=None):
+    args = parse_args(argv)
+    run_masking(
+        model_name=args.model_name,
+        train_csv_file=args.train_csv,
+        eval_csv_file=args.eval_csv,
+        output_dir=args.output_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()
