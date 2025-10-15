@@ -15,11 +15,12 @@ SCRIPT_MAP = {
     "partially_known_icl": PROJECT_ROOT / "partially_known_icl.py",
     "partially_known_prefix": PROJECT_ROOT / "partially_known_prefix_tuning.py",
     "icl": PROJECT_ROOT / "in_context_learning.py",
-    "icl_privacy": PROJECT_ROOT / "in_context_learning_privacy_guarantee.py",
+    "icl_privacy": PROJECT_ROOT / "in_context_learning_privacy_enhancement.py",
     "prefix_tuning": PROJECT_ROOT / "prefix_tuning.py",
     "masking": PROJECT_ROOT / "masking.py",
     "prefix_eval": PROJECT_ROOT / "prefix_tuning_inference.py",
     "masking_eval": PROJECT_ROOT / "prefix_tuning_inference.py",
+    "perplexity": PROJECT_ROOT / "evaluate_perplexity.py",
 }
 
 

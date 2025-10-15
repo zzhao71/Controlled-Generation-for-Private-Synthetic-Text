@@ -1,437 +1,397 @@
 import argparse
 import csv
-import json
-import math
 import random
-import re
 import string
-from dataclasses import dataclass
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import evaluate
 import torch
 from presidio_analyzer import AnalyzerEngine
-from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
-
-from privacy_metrics.Metrics import entities_in_paragraph, leaked_percentage
+from peft import PrefixTuningConfig, TaskType, get_peft_model
+from torch.utils.data import Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, set_seed
 
 DEFAULT_MODEL_NAME = "princeton-nlp/Sheared-LLaMA-1.3B"
-DEFAULT_CHECKPOINT_DIR = Path("sheared-llama-privacy-prefix-partial")
-DEFAULT_CHECKPOINT_NAME = "final_checkpoint"
-DEFAULT_INPUT_CSV = Path("fine_tuning_data_first_six_paragraphs_direct.csv")
-DEFAULT_OUTPUT_JSONL = Path("synthetic_ft_data_partial_prefix.jsonl")
-DEFAULT_CONTEXT_SIZE = 3
-DEFAULT_MAX_ROWS: Optional[int] = 100
-DEFAULT_MAX_NEW_TOKENS = 400
-DEFAULT_TEMPERATURE = 0.7
-DEFAULT_TOP_P = 0.9
+DEFAULT_TRAIN_CSV = Path("fine_tuning_data_echr_test_first_6_paragraphs_direct.csv")
+DEFAULT_EVAL_CSV = Path("fine_tuning_data_echr_test_first_6_paragraphs_direct.csv")
+DEFAULT_OUTPUT_DIR = Path("sheared-llama-partial-prefix")
+DEFAULT_VIRTUAL_TOKENS = 20
+DEFAULT_MAX_LENGTH = 1024
+DEFAULT_BATCH_SIZE = 4
+DEFAULT_GRAD_ACCUM = 4
+DEFAULT_NUM_EPOCHS = 3
+DEFAULT_LR = 5e-5
+DEFAULT_EVAL_STEPS = 200
+DEFAULT_SAVE_STEPS = 200
+DEFAULT_LOGGING_STEPS = 50
+DEFAULT_DROP_PROB = 0.35
+DEFAULT_NOISE_PROB = 0.2
 
-STOP_STRINGS = [
-    "CODE:",
-    "LOC:",
-    "ORG:",
-    "DEM:",
-    "QUANTITY:",
-    "DATETIME:",
-    "PERSON:",
-    "MISE:",
+ENTITY_MAPPING = {
+    "CODE": "CODE",
+    "PERSON": "PERSON",
+    "LOCATION": "LOC",
+    "DATE_TIME": "DATETIME",
+    "ORGANIZATION": "ORG",
+    "DEMOGRAPHICS": "DEM",
+    "QUANTITY": "QUANTITY",
+}
+
+
+def random_code() -> str:
+    body = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+    tail = "".join(random.choices(string.ascii_uppercase + string.digits, k=2))
+    return f"{body}/{tail}"
+
+
+FIRST_NAMES = [
+    "Alex",
+    "Blake",
+    "Casey",
+    "Dana",
+    "Elliot",
+    "Finley",
+    "Harper",
+    "Jordan",
+    "Kai",
+    "Logan",
+    "Morgan",
+    "Quinn",
+    "Riley",
+    "Skyler",
+]
+LAST_NAMES = [
+    "Adams",
+    "Baker",
+    "Carson",
+    "Dawson",
+    "Ellis",
+    "Foster",
+    "Griffin",
+    "Hayes",
+    "Irwin",
+    "Johnson",
+    "Kennedy",
+    "Lewis",
 ]
 
 
-@dataclass
-class PartialPrefixConfig:
-    model_name: str = DEFAULT_MODEL_NAME
-    checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR
-    checkpoint_name: str = DEFAULT_CHECKPOINT_NAME
-    input_csv: Path = DEFAULT_INPUT_CSV
-    output_jsonl: Path = DEFAULT_OUTPUT_JSONL
-    context_size: int = DEFAULT_CONTEXT_SIZE
-    max_rows: Optional[int] = DEFAULT_MAX_ROWS
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS
-    temperature: float = DEFAULT_TEMPERATURE
-    top_p: float = DEFAULT_TOP_P
+def random_person() -> str:
+    return f"{random.choice(['Mr', 'Ms', 'Dr', 'Prof'])} {random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
 
 
-def parse_args() -> PartialPrefixConfig:
-    parser = argparse.ArgumentParser(description="Partially known prefix tuning evaluation with Presidio control codes.")
-    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME, help="Base model identifier to load.")
-    parser.add_argument(
-        "--checkpoint-dir",
-        type=Path,
-        default=DEFAULT_CHECKPOINT_DIR,
-        help="Directory containing the PEFT checkpoint.",
-    )
-    parser.add_argument(
-        "--checkpoint-name",
-        default=DEFAULT_CHECKPOINT_NAME,
-        help="Checkpoint subdirectory name inside --checkpoint-dir.",
-    )
-    parser.add_argument(
-        "--input-csv",
-        type=Path,
-        default=DEFAULT_INPUT_CSV,
-        help="CSV file containing official control codes and reference outputs.",
-    )
-    parser.add_argument(
-        "--output-jsonl",
-        type=Path,
-        default=DEFAULT_OUTPUT_JSONL,
-        help="Destination for generated prompt/output pairs.",
-    )
-    parser.add_argument(
-        "--context-size",
-        type=int,
-        default=DEFAULT_CONTEXT_SIZE,
-        help="Number of examples to concatenate before generation.",
-    )
-    parser.add_argument(
-        "--max-rows",
-        type=int,
-        default=DEFAULT_MAX_ROWS if DEFAULT_MAX_ROWS is not None else -1,
-        help="Limit the number of CSV rows to process (<=0 to use all).",
-    )
-    parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=DEFAULT_MAX_NEW_TOKENS,
-        help="Maximum number of tokens to generate per context window.",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=DEFAULT_TEMPERATURE,
-        help="Sampling temperature for generation.",
-    )
-    parser.add_argument(
-        "--top-p",
-        type=float,
-        default=DEFAULT_TOP_P,
-        help="Nucleus sampling top-p.",
-    )
-
-    args = parser.parse_args()
-    max_rows = args.max_rows
-    if max_rows is not None and max_rows <= 0:
-        max_rows = None
-
-    return PartialPrefixConfig(
-        model_name=args.model_name,
-        checkpoint_dir=args.checkpoint_dir,
-        checkpoint_name=args.checkpoint_name,
-        input_csv=args.input_csv,
-        output_jsonl=args.output_jsonl,
-        context_size=max(1, args.context_size),
-        max_rows=max_rows,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-    )
+CITIES = ["Baltimore", "Seattle", "Tokyo", "Munich", "Cairo"]
+COUNTRIES = ["USA", "Germany", "Japan", "Kenya", "Brazil"]
+ADDRESSES = ["221B Baker St", "1600 Amphitheatre Pkwy", "350 Fifth Ave"]
+INFRASTRUCTURE = ["London Bridge", "Central Station", "Pier 39"]
 
 
-class StopOnCode(StoppingCriteria):
-    def __init__(self, tokenizer):
-        super().__init__()
-        self.stop_ids_list = [tokenizer.encode(pattern, add_special_tokens=False) for pattern in STOP_STRINGS]
-
-    def __call__(self, input_ids: torch.LongTensor, scores, **kwargs) -> bool:
-        for stop_ids in self.stop_ids_list:
-            if input_ids.shape[1] < len(stop_ids):
-                continue
-            if input_ids[0, -len(stop_ids) :].tolist() == stop_ids:
-                return True
-        return False
+def random_loc() -> str:
+    return random.choice(CITIES + COUNTRIES + ADDRESSES + INFRASTRUCTURE)
 
 
-def extract_private_entities(text: str, analyzer: AnalyzerEngine) -> str:
-    entity_mapping = {
-        "CODE": "CODE",
-        "PERSON": "PERSON",
-        "LOCATION": "LOC",
-        "DATE_TIME": "DATETIME",
-        "ORGANIZATION": "ORG",
-        "DEMOGRAPHICS": "DEM",
-        "QUANTITY": "QUANTITY",
-    }
+ORGS = [
+    "OpenAI",
+    "World Health Organization",
+    "Harvard University",
+    "UNICEF",
+    "St. Mary's Hospital",
+    "SpaceX",
+    "NASA",
+    "MIT",
+    "Stanford University",
+    "Google",
+]
 
-    results = analyzer.analyze(text=text, language="en")
+
+def random_org() -> str:
+    return random.choice(ORGS)
+
+
+HERITAGE = ["Irish-American", "Nigerian", "Chinese", "Latinx", "Punjabi"]
+JOBS = ["software engineer", "nurse", "professor", "mechanic", "pilot"]
+
+
+def random_age() -> str:
+    return f"{random.randint(18, 85)}-year-old"
+
+
+def random_dem() -> str:
+    return random.choice([
+        f"{random_age()} {random.choice(JOBS)}",
+        f"{random.choice(HERITAGE)} descent",
+        f"{random.choice(JOBS).title()}",
+        random_age(),
+    ])
+
+
+def random_datetime() -> str:
+    from datetime import datetime, timedelta
+
+    start = datetime(1990, 1, 1)
+    end = datetime(2024, 12, 31)
+    delta = end - start
+    day = start + timedelta(days=random.randint(0, delta.days))
+    return day.strftime("%d %B %Y")
+
+
+def random_quantity() -> str:
+    if random.random() < 0.5:
+        return f"{random.randint(1, 100)}%"
+    return f"${random.randint(1, 999_999):,}"
+
+
+NOISE_GENERATORS = {
+    "CODE": random_code,
+    "PERSON": random_person,
+    "DATETIME": random_datetime,
+    "LOC": random_loc,
+    "ORG": random_org,
+    "DEM": random_dem,
+    "QUANTITY": random_quantity,
+}
+
+
+def build_control_code(
+    text: str,
+    analyzer: AnalyzerEngine,
+    drop_prob: float,
+    noise_prob: float,
+    rng: random.Random,
+) -> str:
+    entities = analyzer.analyze(text=text, language="en")
     grouped: Dict[str, List[str]] = {}
-    for result in results:
-        mapped = entity_mapping.get(result.entity_type, "MISE")
-        grouped.setdefault(mapped, []).append(text[result.start : result.end])
+    for result in entities:
+        mapped = ENTITY_MAPPING.get(result.entity_type, "MISE")
+        value = text[result.start : result.end].strip()
+        if value:
+            grouped.setdefault(mapped, []).append(value)
 
-    formatted = []
-    for entity_type, values in grouped.items():
-        formatted.append(f"{entity_type}: {', '.join(values)}")
-    return "\n".join(formatted)
+    lines: List[str] = []
+    for tag, values in grouped.items():
+        kept = [v for v in values if rng.random() > drop_prob]
+        if not kept and values:
+            kept = [values[rng.randrange(len(values))]]
+        if kept:
+            unique = list(dict.fromkeys(kept))
+            lines.append(f"{tag}: {', '.join(unique)}")
+
+    for tag, generator in NOISE_GENERATORS.items():
+        if rng.random() < noise_prob:
+            lines.append(f"{tag}: {generator()}")
+
+    return "\n".join(lines)
 
 
-def build_generators() -> Dict[str, callable]:
-    def random_code():
-        body = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
-        tail = "".join(random.choices(string.ascii_uppercase + string.digits, k=2))
-        return f"{body}/{tail}"
+class PartialPrefixDataset(Dataset):
+    def __init__(
+        self,
+        file_path: Path,
+        tokenizer,
+        analyzer: AnalyzerEngine,
+        max_length: int,
+        drop_prob: float,
+        noise_prob: float,
+        max_samples: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.examples: List[Dict[str, str]] = []
+        rng = random.Random(seed)
 
-    first_names = [
-        "Alex",
-        "Blake",
-        "Casey",
-        "Dana",
-        "Elliot",
-        "Finley",
-        "Harper",
-        "Jordan",
-        "Kai",
-        "Logan",
-        "Morgan",
-        "Quinn",
-        "Riley",
-        "Skyler",
-    ]
-    last_names = [
-        "Adams",
-        "Baker",
-        "Carson",
-        "Dawson",
-        "Ellis",
-        "Foster",
-        "Griffin",
-        "Hayes",
-        "Irwin",
-        "Johnson",
-        "Kennedy",
-        "Lewis",
-    ]
+        with file_path.open(newline="", encoding="utf-8") as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                output_text = row.get("output", "").strip()
+                if not output_text:
+                    continue
+                control_code = build_control_code(output_text, analyzer, drop_prob, noise_prob, rng)
+                if not control_code:
+                    continue
+                self.examples.append({
+                    "input_text": control_code,
+                    "output_text": output_text,
+                })
+                if max_samples is not None and len(self.examples) >= max_samples:
+                    break
 
-    def random_person():
-        return f"{random.choice(['Mr', 'Ms', 'Dr', 'Prof'])} {random.choice(first_names)} {random.choice(last_names)}"
+        if not self.examples:
+            raise RuntimeError("No training examples constructed from the provided CSV. Check that Presidio detects entities.")
 
-    def random_datetime(start_year: int = 1990, end_year: int = 2024):
-        start_dt = datetime(start_year, 1, 1)
-        span_days = (datetime(end_year, 12, 31) - start_dt).days
-        day = start_dt + timedelta(days=random.randint(0, span_days))
-        return day.strftime("%d %B %Y")
+    def __len__(self) -> int:
+        return len(self.examples)
 
-    cities = ["Baltimore", "Seattle", "Tokyo", "Munich", "Cairo"]
-    countries = ["USA", "Germany", "Japan", "Kenya", "Brazil"]
-    addresses = ["221B Baker St", "1600 Amphitheatre Pkwy", "350 Fifth Ave"]
-    infrastructure = ["London Bridge", "Central Station", "Pier 39"]
-
-    def random_loc():
-        return random.choice(cities + countries + addresses + infrastructure)
-
-    orgs = [
-        "OpenAI",
-        "World Health Organization",
-        "Harvard University",
-        "UNICEF",
-        "St. Mary's Hospital",
-        "SpaceX",
-        "NASA",
-        "MIT",
-        "Stanford University",
-        "Google",
-    ]
-
-    def random_org():
-        return random.choice(orgs)
-
-    heritage = ["Irish-American", "Nigerian", "Chinese", "Latinx", "Punjabi"]
-    jobs = ["software engineer", "nurse", "professor", "mechanic", "pilot"]
-
-    def random_age():
-        return f"{random.randint(18, 85)}-year-old"
-
-    def random_dem():
-        pattern = random.choice(
-            [
-                f"{random_age()} {random.choice(jobs)}",
-                f"{random.choice(heritage)} descent",
-                f"{random.choice(jobs).title()}",
-                f"{random_age()}",
-            ]
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        example = self.examples[idx]
+        half = self.max_length // 2
+        input_enc = self.tokenizer(
+            example["input_text"],
+            max_length=half,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
         )
-        return pattern
+        output_enc = self.tokenizer(
+            example["output_text"],
+            max_length=half,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        input_ids = torch.cat([input_enc.input_ids.squeeze(), output_enc.input_ids.squeeze()])[: self.max_length]
+        attention_mask = torch.cat([
+            input_enc.attention_mask.squeeze(),
+            output_enc.attention_mask.squeeze(),
+        ])[: self.max_length]
+        labels = torch.cat([
+            torch.full_like(input_enc.input_ids.squeeze(), -100),
+            output_enc.input_ids.squeeze(),
+        ])[: self.max_length]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
 
-    def random_quantity():
-        if random.random() < 0.5:
-            return f"{random.randint(1, 100)}%"
-        return f"${random.randint(1, 999_999):,}"
 
+def data_collator(batch):
+    input_ids = torch.stack([item["input_ids"] for item in batch])
+    attention_mask = torch.stack([item["attention_mask"] for item in batch])
+    labels = torch.stack([item["labels"] for item in batch])
     return {
-        "CODE": random_code,
-        "PERSON": random_person,
-        "DATETIME": random_datetime,
-        "LOC": random_loc,
-        "ORG": random_org,
-        "DEM": random_dem,
-        "QUANTITY": random_quantity,
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
     }
 
 
-def load_prefix_model(config: PartialPrefixConfig):
-    base_model = AutoModelForCausalLM.from_pretrained(config.model_name, use_cache=False)
-    from peft import PeftModel
-
-    model_path = config.checkpoint_dir / config.checkpoint_name
-    if not model_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found at {model_path}")
-
-    model = PeftModel.from_pretrained(base_model, model_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return model, tokenizer, device
-
-
-def run_partially_known_prefix(config: PartialPrefixConfig) -> None:
-    analyzer = AnalyzerEngine()
-    model, tokenizer, device = load_prefix_model(config)
-    stopper = StoppingCriteriaList([StopOnCode(tokenizer)])
-    rouge = evaluate.load("rouge")
-    generators = build_generators()
-
-    rows: List[dict] = []
-    with config.input_csv.open(newline="", encoding="utf-8") as csvfile:
-        for idx, row in enumerate(csv.DictReader(csvfile), start=1):
-            rows.append(row)
-            if config.max_rows is not None and idx >= config.max_rows:
-                break
-
-    if not rows:
-        print("No rows found to process.")
-        return
-
-    total_expected_contexts = max(1, math.ceil(len(rows) / config.context_size))
-    pbar = tqdm(total=total_expected_contexts)
-
-    pattern = re.compile(r"^(CODE|PERSON|DATETIME|LOC|ORG|DEM|QUANTITY|MISE):\s*(.*)$", re.MULTILINE)
-
-    privacy_hits = 0
-    leaked_percentage_total = 0.0
-    processed_contexts = 0
-    rouge_2_total = 0.0
-    rouge_l_total = 0.0
-    generate_records: List[dict] = []
-
-    prompt = ""
-    current_count = 0
-    latest_output = ""
-    latest_official_code = ""
-
-    def flush(force: bool = False) -> None:
-        nonlocal prompt, current_count, privacy_hits, leaked_percentage_total
-        nonlocal processed_contexts, rouge_2_total, rouge_l_total, latest_output, latest_official_code
-
-        if current_count == 0:
-            return
-        if current_count < config.context_size and not force:
-            return
-
-        base_prompt = prompt
-        matches = pattern.findall(base_prompt)
-
-        official_matches = pattern.findall(latest_official_code)
-        official_values = []
-        for _, raw_value in official_matches:
-            parts = [item.strip() for item in raw_value.split(",") if item.strip()]
-            official_values.extend(parts)
-
-        latest_by_tag: Dict[str, str] = {}
-        for tag, raw in matches:
-            latest_by_tag.setdefault(tag, raw.strip())
-
-        random_lines = [f"{tag}: {generators[tag]()}" for tag in latest_by_tag if tag in generators]
-        generation_prompt = base_prompt
-        if random_lines:
-            generation_prompt = f"{base_prompt}\n" + "\n".join(random_lines)
-
-        inputs = tokenizer(generation_prompt, return_tensors="pt").to(device)
-        gen_ids = model.generate(
-            **inputs,
-            max_new_tokens=config.max_new_tokens,
-            stopping_criteria=stopper,
-            temperature=config.temperature,
-            top_p=config.top_p,
-            do_sample=True,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-
-        full_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-        generated_text = full_text[len(generation_prompt) :]
-
-        stop_positions = []
-        for token in STOP_STRINGS:
-            pos = generated_text.find(token)
-            if pos >= 0:
-                stop_positions.append(pos)
-        if stop_positions:
-            generated_text = generated_text[: min(stop_positions)].rstrip()
-
-        result_dict = entities_in_paragraph(generated_text, official_values)
-        if any(result_dict.values()):
-            privacy_hits += 1
-        processed_contexts += 1
-
-        leaked_amount = leaked_percentage(generated_text, official_values)
-        leaked_percentage_total += leaked_amount
-
-        scores = rouge.compute(
-            predictions=[generated_text],
-            references=[latest_output],
-            use_stemmer=True,
-            rouge_types=["rouge2", "rougeL"],
-        )
-        rouge_2_total += scores["rouge2"]
-        rouge_l_total += scores["rougeL"]
-
-        generate_records.append({"input": generation_prompt, "generated_text": generated_text})
-
-        privacy_pct = privacy_hits / processed_contexts * 100
-        avg_leaked = leaked_percentage_total / processed_contexts
-        pbar.update(1)
-        pbar.set_postfix({"context": processed_contexts, "privacy": f"{privacy_pct:5.2f}%", "leaked": f"{avg_leaked:5.2f}%"})
-
-        prompt = ""
-        current_count = 0
-
-    for row in rows:
-        text_output = row["output"]
-        control_code = extract_private_entities(text_output, analyzer)
-        prompt += f"{control_code}\n{text_output}\n\n"
-        latest_output = text_output
-        latest_official_code = row["input"]
-        current_count += 1
-
-        if current_count == config.context_size:
-            flush()
-
-    flush(force=True)
-    pbar.close()
-
-    if processed_contexts > 0:
-        print(f"Final Privacy percentage: {privacy_hits / processed_contexts * 100:.2f}%")
-        print(f"Final Leaked percentage: {leaked_percentage_total / processed_contexts:.2f}%")
-        print(f"Final Rouge-2 score: {rouge_2_total / processed_contexts:.4f}")
-        print(f"Final Rouge-L score: {rouge_l_total / processed_contexts:.4f}")
-        print(f"Total contexts processed: {processed_contexts}")
-
-    config.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
-    with config.output_jsonl.open("w", encoding="utf-8") as f:
-        for record in generate_records:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    print(f"Generated records have been saved to {config.output_jsonl}.")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Prefix tuning using partial control codes extracted with Presidio.")
+    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME, help="Base model identifier to load.")
+    parser.add_argument("--train-csv", type=Path, default=DEFAULT_TRAIN_CSV, help="CSV containing outputs for training.")
+    parser.add_argument("--eval-csv", type=Path, default=DEFAULT_EVAL_CSV, help="Optional CSV for evaluation (same pipeline).")
+    parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory to store checkpoints.")
+    parser.add_argument("--final-checkpoint-name", default="final_checkpoint", help="Subdirectory name for the saved adapter.")
+    parser.add_argument("--virtual-token-count", type=int, default=DEFAULT_VIRTUAL_TOKENS, help="Number of virtual tokens in the prefix.")
+    parser.add_argument("--no-prefix-projection", action="store_true", help="Disable the prefix projection layer.")
+    parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH, help="Maximum combined sequence length.")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Per-device training batch size.")
+    parser.add_argument("--eval-batch-size", type=int, default=None, help="Per-device evaluation batch size (defaults to training batch size).")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=DEFAULT_GRAD_ACCUM, help="Gradient accumulation steps.")
+    parser.add_argument("--num-epochs", type=int, default=DEFAULT_NUM_EPOCHS, help="Number of training epochs.")
+    parser.add_argument("--learning-rate", type=float, default=DEFAULT_LR, help="Learning rate.")
+    parser.add_argument("--eval-steps", type=int, default=DEFAULT_EVAL_STEPS, help="Evaluation interval in steps (<=0 evaluates each epoch).")
+    parser.add_argument("--save-steps", type=int, default=DEFAULT_SAVE_STEPS, help="Checkpoint save interval in steps (<=0 saves each epoch).")
+    parser.add_argument("--save-total-limit", type=int, default=3, help="Maximum number of checkpoints to keep.")
+    parser.add_argument("--logging-steps", type=int, default=DEFAULT_LOGGING_STEPS, help="Logging interval in steps.")
+    parser.add_argument("--drop-prob", type=float, default=DEFAULT_DROP_PROB, help="Probability of dropping an extracted entity line.")
+    parser.add_argument("--noise-prob", type=float, default=DEFAULT_NOISE_PROB, help="Probability of adding a random synthetic line.")
+    parser.add_argument("--max-train-samples", type=int, default=None, help="Optional cap on training samples.")
+    parser.add_argument("--max-eval-samples", type=int, default=None, help="Optional cap on evaluation samples.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed.")
+    parser.add_argument("--fp16", dest="fp16", action="store_true", help="Enable FP16 training when CUDA is available.")
+    parser.add_argument("--no-fp16", dest="fp16", action="store_false", help="Disable FP16 training.")
+    parser.set_defaults(fp16=True)
+    return parser.parse_args()
 
 
 def main() -> None:
-    config = parse_args()
-    run_partially_known_prefix(config)
+    args = parse_args()
+
+    if args.seed is not None:
+        set_seed(args.seed)
+        random.seed(args.seed)
+
+    analyzer = AnalyzerEngine()
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    base_model = AutoModelForCausalLM.from_pretrained(args.model_name)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    peft_config = PrefixTuningConfig(
+        task_type=TaskType.CAUSAL_LM,
+        num_virtual_tokens=args.virtual_token_count,
+        prefix_projection=not args.no_prefix_projection,
+        inference_mode=False,
+    )
+    model = get_peft_model(base_model, peft_config)
+
+    train_dataset = PartialPrefixDataset(
+        args.train_csv,
+        tokenizer,
+        analyzer,
+        max_length=args.max_length,
+        drop_prob=args.drop_prob,
+        noise_prob=args.noise_prob,
+        max_samples=args.max_train_samples,
+        seed=args.seed,
+    )
+
+    eval_dataset = None
+    if args.eval_csv and args.eval_csv.exists():
+        eval_dataset = PartialPrefixDataset(
+            args.eval_csv,
+            tokenizer,
+            analyzer,
+            max_length=args.max_length,
+            drop_prob=args.drop_prob,
+            noise_prob=args.noise_prob,
+            max_samples=args.max_eval_samples,
+            seed=args.seed,
+        )
+
+    evaluation_strategy = "no"
+    eval_steps = None
+    if eval_dataset is not None:
+        if args.eval_steps and args.eval_steps > 0:
+            evaluation_strategy = "steps"
+            eval_steps = args.eval_steps
+        else:
+            evaluation_strategy = "epoch"
+
+    save_strategy = "steps" if args.save_steps and args.save_steps > 0 else "epoch"
+    eval_batch_size = args.eval_batch_size or args.batch_size
+
+    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    training_args = TrainingArguments(
+        output_dir=str(args.checkpoint_dir),
+        num_train_epochs=args.num_epochs,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=eval_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        evaluation_strategy=evaluation_strategy,
+        eval_steps=eval_steps,
+        save_strategy=save_strategy,
+        save_steps=args.save_steps if save_strategy == "steps" else None,
+        learning_rate=args.learning_rate,
+        fp16=args.fp16 and torch.cuda.is_available(),
+        logging_dir=str(args.checkpoint_dir / "logs"),
+        logging_steps=args.logging_steps,
+        save_total_limit=args.save_total_limit,
+        report_to="none",
+        load_best_model_at_end=False,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=data_collator,
+    )
+
+    trainer.train()
+
+    final_dir = args.checkpoint_dir / args.final_checkpoint_name
+    final_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
+    print(f"Model saved to {final_dir}")
 
 
 if __name__ == "__main__":
