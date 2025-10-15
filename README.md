@@ -135,7 +135,8 @@ python evaluation_perplexity.py
 ## Citation
 If you use this code in your research, please cite the following paper:
 
-```@inproceedings{zhao2025controlled,
+```
+@inproceedings{zhao2025controlled,
   title={Controlled Generation for Private Synthetic Text},
   author={Zhao, Zihao and Field, Anjalie},
   booktitle={Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing (EMNLP)},
